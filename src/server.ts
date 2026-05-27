@@ -1,91 +1,139 @@
-import { MCP_PROTOCOL_VERSION, MCP_CAPABILITIES } from './core/constants';
-import { logger } from './utils/logger';
-import { MessageHandler } from './core/message-handler';
-import { TaskService } from './services/task-service';
-import { ToolHandler } from './handlers/tool-handler';
-import { ResourceHandler } from './handlers/resource-handler';
-import { MCPServerInfo } from './types/mcp';
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+import { v4 as uuidv4 } from "uuid";
+import { type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 
-const serverConfig: MCPServerInfo = {
-  name: 'mcp-todo-server',
-  version: '1.0.0',
-  capabilities: MCP_CAPABILITIES,
-  protocolVersion: MCP_PROTOCOL_VERSION
+type Task = {
+  id: string;
+  text: string;
+  completed: boolean;
+  createdAt: string;
+  updatedAt: string;
 };
 
-function initializeServer(): MessageHandler {
-  const taskService = new TaskService();
-  const toolHandler = new ToolHandler(taskService);
-  const resourceHandler = new ResourceHandler(taskService);
+export const getServer = (): McpServer => {
+  const tasks: Task[] = [];
 
-  const messageHandler = new MessageHandler(
-    serverConfig,
-    toolHandler,
-    resourceHandler
+  const server = new McpServer(
+    { name: "mcp-todo-server", version: "1.0.0" },
+    { capabilities: {} },
   );
 
-  logger.info('MCP Server initialized', {
-    server: serverConfig.name,
-    version: serverConfig.version,
-    protocol: serverConfig.protocolVersion
-  });
+  const text = (s: string): CallToolResult => ({ content: [{ type: "text", text: s }] });
 
-  return messageHandler;
-}
+  server.registerTool(
+    "create_task",
+    {
+      title: "Create Task",
+      description: "Creates a new task in the todo list",
+      inputSchema: { text: z.string().min(1).max(500).describe("Task text") },
+    },
+    async ({ text: t }): Promise<CallToolResult> => {
+      const now = new Date().toISOString();
+      const task: Task = { id: uuidv4(), text: t.trim(), completed: false, createdAt: now, updatedAt: now };
+      tasks.push(task);
+      return text(`Created task ${task.id}: "${task.text}"`);
+    },
+  );
 
-async function main(): Promise<void> {
-  const messageHandler = initializeServer();
+  server.registerTool(
+    "get_tasks",
+    {
+      title: "Get Tasks",
+      description: "Retrieves tasks with filtering",
+      inputSchema: { filter: z.enum(["all", "pending", "completed"]).describe("Filter by status") },
+    },
+    async ({ filter }): Promise<CallToolResult> => {
+      const filtered = tasks.filter((x) =>
+        filter === "all" ? true : filter === "completed" ? x.completed : !x.completed,
+      );
+      return text(JSON.stringify(filtered, null, 2));
+    },
+  );
 
-  process.stdin.setEncoding('utf8');
-  let messageBuffer = '';
+  server.registerTool(
+    "update_task",
+    {
+      title: "Update Task",
+      description: "Updates a task completion status by ID",
+      inputSchema: {
+        id: z.string().uuid().describe("Task UUID"),
+        completed: z.boolean().describe("Completion status"),
+      },
+    },
+    async ({ id, completed }): Promise<CallToolResult> => {
+      const t = tasks.find((x) => x.id === id);
+      if (!t) return text(`Task ${id} not found`);
+      t.completed = completed;
+      t.updatedAt = new Date().toISOString();
+      return text(`Updated task ${id}: completed=${completed}`);
+    },
+  );
 
-  process.stdin.on('data', async (chunk: string) => {
-    messageBuffer += chunk;
+  server.registerTool(
+    "complete_task_by_text",
+    {
+      title: "Complete Task By Text",
+      description: "Marks a task as completed by partial text match",
+      inputSchema: { text: z.string().min(1).max(500).describe("Text to match") },
+    },
+    async ({ text: q }): Promise<CallToolResult> => {
+      const t = tasks.find((x) => x.text.toLowerCase().includes(q.toLowerCase()) && !x.completed);
+      if (!t) return text(`No matching pending task found for "${q}"`);
+      t.completed = true;
+      t.updatedAt = new Date().toISOString();
+      return text(`Completed task ${t.id}: "${t.text}"`);
+    },
+  );
 
-    let messageEnd: number;
-    while ((messageEnd = messageBuffer.indexOf('\n')) !== -1) {
-      const rawMessage = messageBuffer.slice(0, messageEnd).trim();
-      messageBuffer = messageBuffer.slice(messageEnd + 1);
-
-      if (rawMessage) {
-        try {
-          const response = await messageHandler.handleMessage(rawMessage);
-          if (response) {
-            process.stdout.write(JSON.stringify(response) + '\n');
-          }
-        } catch (error) {
-          logger.error('Message processing error', {
-            message: rawMessage,
-            error: (error as Error).message
-          });
-        }
+  server.registerTool(
+    "analyze_tasks",
+    {
+      title: "Analyze Tasks",
+      description: "Analyzes the todo list",
+      inputSchema: { analysis_type: z.enum(["summary", "progress", "suggestions"]) },
+    },
+    async ({ analysis_type }): Promise<CallToolResult> => {
+      const total = tasks.length;
+      const done = tasks.filter((x) => x.completed).length;
+      const pending = total - done;
+      if (analysis_type === "summary") return text(`Total: ${total}, Done: ${done}, Pending: ${pending}`);
+      if (analysis_type === "progress") {
+        const pct = total === 0 ? 0 : Math.round((done / total) * 100);
+        return text(`Progress: ${pct}% (${done}/${total})`);
       }
-    }
-  });
+      return text(pending === 0 ? "All caught up!" : `You have ${pending} pending tasks. Pick the smallest one first.`);
+    },
+  );
 
-  process.stdin.on('end', () => {
-    logger.info('Client disconnected');
-    process.exit(0);
-  });
+  server.registerTool(
+    "delete_task",
+    {
+      title: "Delete Task",
+      description: "Deletes a task by ID",
+      inputSchema: { id: z.string().uuid().describe("Task UUID") },
+    },
+    async ({ id }): Promise<CallToolResult> => {
+      const idx = tasks.findIndex((x) => x.id === id);
+      if (idx === -1) return text(`Task ${id} not found`);
+      const [deleted] = tasks.splice(idx, 1);
+      return text(`Deleted task ${deleted.id}: "${deleted.text}"`);
+    },
+  );
 
-  process.on('uncaughtException', (error: Error) => {
-    logger.error('Uncaught exception', { error: error.message, stack: error.stack });
-    process.exit(1);
-  });
+  server.registerTool(
+    "clear_all_tasks",
+    {
+      title: "Clear All Tasks",
+      description: "Removes all tasks",
+      inputSchema: {},
+    },
+    async (): Promise<CallToolResult> => {
+      const n = tasks.length;
+      tasks.length = 0;
+      return text(`Cleared ${n} tasks`);
+    },
+  );
 
-  process.on('unhandledRejection', (reason: any, promise: Promise<any>) => {
-    logger.error('Unhandled promise rejection', { reason, promise });
-    process.exit(1);
-  });
-
-  logger.info('MCP Server started and listening on stdio');
-}
-
-if (require.main === module) {
-  main().catch((error: Error) => {
-    logger.error('Server startup failed', { error: error.message });
-    process.exit(1);
-  });
-}
-
-export { initializeServer, serverConfig };
+  return server;
+};
